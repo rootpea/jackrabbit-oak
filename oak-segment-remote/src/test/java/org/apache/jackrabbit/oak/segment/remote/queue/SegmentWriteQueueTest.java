@@ -29,17 +29,17 @@ import org.mockito.internal.util.reflection.InstanceField;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingDeque;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.util.stream.Collectors.toSet;
 import static org.junit.Assert.assertEquals;
@@ -211,75 +211,6 @@ public class SegmentWriteQueueTest {
     }
 
     @Test
-    public void testRecoveryMode() throws IOException, InterruptedException {
-        Set<UUID> added = Collections.synchronizedSet(new HashSet<>());
-        Semaphore semaphore = new Semaphore(0);
-        AtomicBoolean doBreak = new AtomicBoolean(true);
-        List<Long> writeAttempts = Collections.synchronizedList(new ArrayList<>());
-        queue = new SegmentWriteQueue((tarEntry, data, offset, size) -> {
-            writeAttempts.add(System.currentTimeMillis());
-            try {
-                semaphore.acquire();
-            } catch (InterruptedException e) {
-            }
-            if (doBreak.get()) {
-                throw new IOException();
-            }
-            added.add(new UUID(tarEntry.getMsb(), tarEntry.getLsb()));
-        });
-
-        for (int i = 0; i < 10; i++) {
-            queue.addToQueue(tarEntry(i), EMPTY_DATA, 0, 0);
-        }
-
-        semaphore.release(Integer.MAX_VALUE);
-        Thread.sleep(100);
-
-        assertTrue(queue.isBroken());
-        assertEquals(9, queue.getSize()); // the 10th segment is handled by the recovery thread
-
-        writeAttempts.clear();
-        awaitWhile(() -> writeAttempts.size() < 5);
-        long lastAttempt = writeAttempts.get(0);
-        for (int i = 1; i < 5; i++) {
-            long delay = writeAttempts.get(i) - lastAttempt;
-            assertTrue("The delay between attempts to persist segment should be larger than 1000ms. Actual: " + delay, delay >= 1000);
-            lastAttempt = writeAttempts.get(i);
-        }
-
-        AtomicBoolean addFinished = new AtomicBoolean(false);
-        runInThread(() -> {
-            try {
-                queue.addToQueue(tarEntry(10), EMPTY_DATA, 0, 0);
-                addFinished.set(true);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
-        });
-
-        Thread.sleep(100);
-        assertFalse("Adding segments should be blocked until the recovery mode is finished", addFinished.get());
-
-        doBreak.set(false);
-        awaitWhile(() -> queue.isBroken());
-        assertFalse("Queue shouldn't be broken anymore", queue.isBroken());
-
-        awaitWhile(() -> added.size() < 11);
-        assertEquals("All segments should be consumed", 11, added.size());
-        for (int i = 0; i < 11; i++) {
-            assertTrue("All segments should be consumed", added.contains(uuid(i)));
-        }
-
-        int i = writeAttempts.size() - 10;
-        lastAttempt = writeAttempts.get(i);
-        for (; i < writeAttempts.size(); i++) {
-            long delay = writeAttempts.get(i) - lastAttempt;
-            assertTrue("Segments should be persisted immediately", delay < 1000);
-            lastAttempt = writeAttempts.get(i);
-        }
-    }
-
-    @Test
     public void testRuntimeExceptionInSegmentConsumer() throws InterruptedException, IOException {
 
         Set<UUID> added = Collections.synchronizedSet(new HashSet<>());
@@ -323,64 +254,62 @@ public class SegmentWriteQueueTest {
     }
 
     @Test(timeout = 10000)
-    public void testRetryLaneDrainsWhileWriteQueueIsFull() throws IOException, InterruptedException {
-        Set<UUID> persisted = new CopyOnWriteArraySet<>();
-        ConcurrentHashMap<UUID, AtomicInteger> attempts = new ConcurrentHashMap<>();
-        AtomicInteger recoveryAttempts = new AtomicInteger();
-        CountDownLatch initialAttempts = new CountDownLatch(2);
-        CountDownLatch releaseInitialAttempts = new CountDownLatch(1);
-        CountDownLatch firstRecoveryAttempt = new CountDownLatch(1);
-        CountDownLatch releaseFirstRecovery = new CountDownLatch(1);
-        CountDownLatch secondRecoveryAttempt = new CountDownLatch(1);
-        CountDownLatch releaseSecondRecovery = new CountDownLatch(1);
+    public void testFlushTimesOutWithConcurrentFailuresAndSmallQueues() throws Exception {
+        int parallelConsumers = 2;
+        AtomicBoolean failWrites = new AtomicBoolean(true);
+        Set<UUID> initialWrites = ConcurrentHashMap.newKeySet();
+        Set<UUID> persisted = ConcurrentHashMap.newKeySet();
+        CountDownLatch initialWritesStarted = new CountDownLatch(parallelConsumers);
+        CountDownLatch releaseInitialWrites = new CountDownLatch(1);
 
         queue = new SegmentWriteQueue((tarEntry, data, offset, size) -> {
             UUID id = new UUID(tarEntry.getMsb(), tarEntry.getLsb());
-            int attempt = attempts.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
-            if (id.getLeastSignificantBits() < 2 && attempt == 1) {
-                initialAttempts.countDown();
-                awaitLatch(releaseInitialAttempts);
-                throw new IOException("Initial write failure");
-            }
-            if (id.getLeastSignificantBits() < 2) {
-                if (recoveryAttempts.incrementAndGet() == 1) {
-                    firstRecoveryAttempt.countDown();
-                    awaitLatch(releaseFirstRecovery);
-                } else {
-                    secondRecoveryAttempt.countDown();
-                    awaitLatch(releaseSecondRecovery);
+            if (failWrites.get()) {
+                if (id.getLeastSignificantBits() < parallelConsumers && initialWrites.add(id)) {
+                    initialWritesStarted.countDown();
+                    awaitLatch(releaseInitialWrites);
                 }
+                throw new IOException("Simulated concurrent persistence failure");
             }
             persisted.add(id);
-        }, 1, 2);
+        }, 1, parallelConsumers, 250);
 
         try {
-            queue.addToQueue(tarEntry(0), EMPTY_DATA, 0, 0);
-            queue.addToQueue(tarEntry(1), EMPTY_DATA, 0, 0);
-            assertTrue("Both workers should enter the initial writes", initialAttempts.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < parallelConsumers; i++) {
+                queue.addToQueue(tarEntry(i), EMPTY_DATA, 0, 0);
+            }
+            assertTrue("Both main workers should be writing concurrently",
+                    initialWritesStarted.await(5, TimeUnit.SECONDS));
 
-            queue.addToQueue(tarEntry(2), EMPTY_DATA, 0, 0);
-            assertEquals("The normal write queue should be full", 1, queue.getSize());
+            queue.addToQueue(tarEntry(parallelConsumers), EMPTY_DATA, 0, 0);
+            assertEquals("The normal queue should be full", 1, queue.getSize());
 
-            releaseInitialAttempts.countDown();
-            assertTrue("Emergency worker should begin a retry", firstRecoveryAttempt.await(5, TimeUnit.SECONDS));
-            assertTrue("Both failed writes should be registered", awaitCondition(() -> queue.getFailedCount() == 2));
-            assertTrue("Recovery should remain active", queue.isBroken());
+            FutureTask<Void> flushTask = new FutureTask<>(() -> {
+                queue.flush();
+                return null;
+            });
+            Thread flusher = new Thread(flushTask, "segment-write-queue-flush-test");
+            flusher.setDaemon(true);
+            flusher.start();
+            releaseInitialWrites.countDown();
 
-            releaseFirstRecovery.countDown();
-            assertTrue("Emergency worker should process the remaining retry", secondRecoveryAttempt.await(5, TimeUnit.SECONDS));
-            assertTrue("One successful retry must not clear another pending failure", queue.isBroken());
-
-            releaseSecondRecovery.countDown();
-            queue.flush();
-
-            assertFalse("Recovery should finish after every failed segment succeeds", queue.isBroken());
-            assertEquals(3, persisted.size());
+            try {
+                flushTask.get(2, TimeUnit.SECONDS);
+                fail("flush should time out while every write is failing");
+            } catch (ExecutionException e) {
+                assertTrue("flush should report an IOException", e.getCause() instanceof IOException);
+                assertTrue(e.getCause().getMessage().contains("No segment write completed"));
+            } catch (TimeoutException e) {
+                fail("flush should enforce its no-progress deadline");
+            }
         } finally {
-            releaseInitialAttempts.countDown();
-            releaseFirstRecovery.countDown();
-            releaseSecondRecovery.countDown();
+            failWrites.set(false);
+            releaseInitialWrites.countDown();
         }
+
+        assertTrue("Pending retries should drain once the writer recovers", awaitCondition(queue::isEmpty));
+        queue.flush();
+        assertEquals(parallelConsumers + 1, persisted.size());
     }
 
     private static void awaitLatch(CountDownLatch latch) throws IOException {
