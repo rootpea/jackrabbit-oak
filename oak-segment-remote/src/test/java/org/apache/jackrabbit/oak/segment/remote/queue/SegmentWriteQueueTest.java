@@ -16,7 +16,9 @@
  */
 package org.apache.jackrabbit.oak.segment.remote.queue;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.CountDownLatch;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import org.apache.jackrabbit.oak.segment.remote.RemoteSegmentArchiveEntry;
@@ -37,6 +39,7 @@ import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static java.util.stream.Collectors.toSet;
 import static org.junit.Assert.assertEquals;
@@ -317,6 +320,86 @@ public class SegmentWriteQueueTest {
 
         assertTrue("Segment queue should be empty", flushFinished.get());
         assertEquals(3, added.size());
+    }
+
+    @Test(timeout = 10000)
+    public void testRetryLaneDrainsWhileWriteQueueIsFull() throws IOException, InterruptedException {
+        Set<UUID> persisted = new CopyOnWriteArraySet<>();
+        ConcurrentHashMap<UUID, AtomicInteger> attempts = new ConcurrentHashMap<>();
+        AtomicInteger recoveryAttempts = new AtomicInteger();
+        CountDownLatch initialAttempts = new CountDownLatch(2);
+        CountDownLatch releaseInitialAttempts = new CountDownLatch(1);
+        CountDownLatch firstRecoveryAttempt = new CountDownLatch(1);
+        CountDownLatch releaseFirstRecovery = new CountDownLatch(1);
+        CountDownLatch secondRecoveryAttempt = new CountDownLatch(1);
+        CountDownLatch releaseSecondRecovery = new CountDownLatch(1);
+
+        queue = new SegmentWriteQueue((tarEntry, data, offset, size) -> {
+            UUID id = new UUID(tarEntry.getMsb(), tarEntry.getLsb());
+            int attempt = attempts.computeIfAbsent(id, ignored -> new AtomicInteger()).incrementAndGet();
+            if (id.getLeastSignificantBits() < 2 && attempt == 1) {
+                initialAttempts.countDown();
+                awaitLatch(releaseInitialAttempts);
+                throw new IOException("Initial write failure");
+            }
+            if (id.getLeastSignificantBits() < 2) {
+                if (recoveryAttempts.incrementAndGet() == 1) {
+                    firstRecoveryAttempt.countDown();
+                    awaitLatch(releaseFirstRecovery);
+                } else {
+                    secondRecoveryAttempt.countDown();
+                    awaitLatch(releaseSecondRecovery);
+                }
+            }
+            persisted.add(id);
+        }, 1, 2);
+
+        try {
+            queue.addToQueue(tarEntry(0), EMPTY_DATA, 0, 0);
+            queue.addToQueue(tarEntry(1), EMPTY_DATA, 0, 0);
+            assertTrue("Both workers should enter the initial writes", initialAttempts.await(5, TimeUnit.SECONDS));
+
+            queue.addToQueue(tarEntry(2), EMPTY_DATA, 0, 0);
+            assertEquals("The normal write queue should be full", 1, queue.getSize());
+
+            releaseInitialAttempts.countDown();
+            assertTrue("Emergency worker should begin a retry", firstRecoveryAttempt.await(5, TimeUnit.SECONDS));
+            assertTrue("Both failed writes should be registered", awaitCondition(() -> queue.getFailedCount() == 2));
+            assertTrue("Recovery should remain active", queue.isBroken());
+
+            releaseFirstRecovery.countDown();
+            assertTrue("Emergency worker should process the remaining retry", secondRecoveryAttempt.await(5, TimeUnit.SECONDS));
+            assertTrue("One successful retry must not clear another pending failure", queue.isBroken());
+
+            releaseSecondRecovery.countDown();
+            queue.flush();
+
+            assertFalse("Recovery should finish after every failed segment succeeds", queue.isBroken());
+            assertEquals(3, persisted.size());
+        } finally {
+            releaseInitialAttempts.countDown();
+            releaseFirstRecovery.countDown();
+            releaseSecondRecovery.countDown();
+        }
+    }
+
+    private static void awaitLatch(CountDownLatch latch) throws IOException {
+        try {
+            if (!latch.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("Timed out waiting for test latch");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(e);
+        }
+    }
+
+    private boolean awaitCondition(Supplier<Boolean> condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!condition.get() && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        return condition.get();
     }
 
     private static RemoteSegmentArchiveEntry tarEntry(long i) {

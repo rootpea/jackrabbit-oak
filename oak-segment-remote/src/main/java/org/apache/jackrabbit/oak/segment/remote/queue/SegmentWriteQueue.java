@@ -22,7 +22,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,7 +45,11 @@ public class SegmentWriteQueue implements Closeable {
 
     private final BlockingDeque<SegmentWriteAction> queue;
 
+    private final BlockingDeque<SegmentWriteAction> retryQueue;
+
     private final Map<UUID, SegmentWriteAction> segmentsByUUID;
+
+    private final Set<UUID> failedSegments;
 
     private final ExecutorService executor;
 
@@ -64,9 +70,11 @@ public class SegmentWriteQueue implements Closeable {
     SegmentWriteQueue(SegmentConsumer writer, int queueSize, int threadNo) {
         this.writer = writer;
         segmentsByUUID = new ConcurrentHashMap<>();
+        failedSegments = new HashSet<>();
         flushLock = new ReentrantReadWriteLock();
 
         queue = new LinkedBlockingDeque<>(queueSize);
+        retryQueue = new LinkedBlockingDeque<>();
         executor = Executors.newFixedThreadPool(threadNo + 1);
         for (int i = 0; i < threadNo; i++) {
             executor.submit(this::mainLoop);
@@ -85,24 +93,17 @@ public class SegmentWriteQueue implements Closeable {
             } catch (SegmentConsumeException e) {
                 SegmentWriteAction segment = e.segment;
                 log.error("Can't persist the segment {}", segment.getUuid(), e.getCause());
-                try {
-                    queue.put(segment);
-                } catch (InterruptedException e1) {
-                    log.error("Can't re-add the segment {} to the queue. It'll be dropped.", segment.getUuid(), e1);
-
-                    synchronized (segmentsByUUID) {
-                        segmentsByUUID.remove(segment.getUuid());
-                        segmentsByUUID.notifyAll();
-                    }
-                }
+                retryQueue.offerLast(segment);
             }
         }
     }
 
     private void consume() throws SegmentConsumeException {
-        SegmentWriteAction segment = null;
+        SegmentWriteAction segment = retryQueue.pollFirst();
         try {
-            segment = queue.poll(100, TimeUnit.MILLISECONDS);
+            if (segment == null) {
+                segment = queue.poll(100, TimeUnit.MILLISECONDS);
+            }
         } catch (InterruptedException e) {
             log.error("Poll from queue interrupted", e);
         }
@@ -115,14 +116,14 @@ public class SegmentWriteQueue implements Closeable {
         try {
             segment.passTo(writer);
         } catch (IOException | RuntimeException e) {
-            setBroken(true);
+            setBroken(segment, true);
             throw new SegmentConsumeException(segment, e);
         }
+        setBroken(segment, false);
         synchronized (segmentsByUUID) {
             segmentsByUUID.remove(segment.getUuid());
             segmentsByUUID.notifyAll();
         }
-        setBroken(false);
     }
 
     private void emergencyLoop() {
@@ -225,13 +226,24 @@ public class SegmentWriteQueue implements Closeable {
         return broken;
     }
 
-    int getSize() {
-        return queue.size();
+    int getFailedCount() {
+        synchronized (brokenMonitor) {
+            return failedSegments.size();
+        }
     }
 
-    private void setBroken(boolean broken) {
+    int getSize() {
+        return queue.size() + retryQueue.size();
+    }
+
+    private void setBroken(SegmentWriteAction segment, boolean failed) {
         synchronized (brokenMonitor) {
-            this.broken = broken;
+            if (failed) {
+                failedSegments.add(segment.getUuid());
+            } else {
+                failedSegments.remove(segment.getUuid());
+            }
+            broken = !failedSegments.isEmpty();
             brokenMonitor.notifyAll();
         }
     }
