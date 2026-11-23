@@ -59,6 +59,8 @@ public class SegmentWriteQueue implements Closeable {
 
     private volatile boolean shutdown;
 
+    private final Object retryMonitor = new Object();
+
     public SegmentWriteQueue(SegmentConsumer writer) {
         this(writer, QUEUE_SIZE, THREADS);
     }
@@ -88,6 +90,10 @@ public class SegmentWriteQueue implements Closeable {
     private void mainLoop() {
         while (!shutdown) {
             try {
+                waitWhileBroken();
+                if (shutdown) {
+                    break;
+                }
                 consume(queue);
             } catch (SegmentConsumeException e) {
                 SegmentWriteAction segment = e.segment;
@@ -102,6 +108,9 @@ public class SegmentWriteQueue implements Closeable {
         while (true) {
             try {
                 retryQueue.putLast(segment);
+                synchronized (retryMonitor) {
+                    retryMonitor.notifyAll();
+                }
                 break;
             } catch (InterruptedException e) {
                 interrupted = true;
@@ -121,16 +130,20 @@ public class SegmentWriteQueue implements Closeable {
             log.error("Poll from queue interrupted", e);
         }
         if (segment != null) {
-            consume(segment);
+            persist(segment);
+            complete(segment);
         }
     }
 
-    private void consume(SegmentWriteAction segment) throws SegmentConsumeException {
+    private void persist(SegmentWriteAction segment) throws SegmentConsumeException {
         try {
             segment.passTo(writer);
         } catch (IOException | RuntimeException e) {
             throw new SegmentConsumeException(segment, e);
         }
+    }
+
+    private void complete(SegmentWriteAction segment) {
         synchronized (segmentsByUUID) {
             segmentsByUUID.remove(segment.getUuid());
             segmentsByUUID.notifyAll();
@@ -139,33 +152,38 @@ public class SegmentWriteQueue implements Closeable {
 
     private void emergencyLoop() {
         while (!shutdown) {
-            boolean success = false;
-            SegmentWriteAction segmentToRetry = null;
-            do {
-                try {
-                    if (segmentToRetry == null) {
-                        consume(retryQueue);
-                    } else {
-                        consume(segmentToRetry);
-                    }
-                    success = true;
-                } catch (SegmentConsumeException e) {
-                    segmentToRetry = e.segment;
-                    log.error("Can't persist the segment {}", segmentToRetry.getUuid(), e.getCause());
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException e1) {
-                        log.warn("Interrupted", e);
-                    }
-                    if (shutdown) {
-                        log.error("Shutdown initiated. The segment {} will be dropped.", segmentToRetry.getUuid());
-                    }
+            waitUntilBroken();
+            if (shutdown) {
+                break;
+            }
+
+            SegmentWriteAction segment = retryQueue.peekFirst();
+            if (segment == null) {
+                continue;
+            }
+            try {
+                persist(segment);
+                retryQueue.removeFirst();
+                synchronized (retryMonitor) {
+                    retryMonitor.notifyAll();
                 }
-            } while (!success && !shutdown);
+                complete(segment);
+            } catch (SegmentConsumeException e) {
+                log.error("Can't persist the segment {}", segment.getUuid(), e.getCause());
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e1) {
+                    log.warn("Interrupted", e);
+                }
+                if (shutdown) {
+                    log.error("Shutdown initiated. The segment {} will be dropped.", segment.getUuid());
+                }
+            }
         }
     }
 
     public void addToQueue(RemoteSegmentArchiveEntry indexEntry, byte[] data, int offset, int size) throws IOException {
+        waitWhileBroken();
         if (shutdown) {
             throw new IllegalStateException("Can't accept the new segment - shutdown in progress");
         }
@@ -173,9 +191,6 @@ public class SegmentWriteQueue implements Closeable {
         SegmentWriteAction action = new SegmentWriteAction(indexEntry, data, offset, size);
         flushLock.readLock().lock();
         try {
-            if (shutdown) {
-                throw new IllegalStateException("Can't accept the new segment - shutdown in progress");
-            }
             segmentsByUUID.put(action.getUuid(), action);
             if (!queue.offer(action, 1, TimeUnit.MINUTES)) {
                 segmentsByUUID.remove(action.getUuid());
@@ -222,13 +237,7 @@ public class SegmentWriteQueue implements Closeable {
 
     @Override
     public void close() throws IOException {
-        flushLock.writeLock().lock();
-        try {
-            flush();
-            shutdown = true;
-        } finally {
-            flushLock.writeLock().unlock();
-        }
+        shutdown = true;
         try {
             executor.shutdown();
             if (!executor.awaitTermination(1, TimeUnit.MINUTES)) {
@@ -243,8 +252,36 @@ public class SegmentWriteQueue implements Closeable {
         return segmentsByUUID.isEmpty();
     }
 
+    boolean isBroken() {
+        return !retryQueue.isEmpty();
+    }
+
     int getSize() {
         return queue.size() + retryQueue.size();
+    }
+
+    private void waitWhileBroken() {
+        synchronized (retryMonitor) {
+            while (isBroken() && !shutdown) {
+                try {
+                    retryMonitor.wait(100);
+                } catch (InterruptedException e) {
+                    log.warn("Interrupted", e);
+                }
+            }
+        }
+    }
+
+    private void waitUntilBroken() {
+        synchronized (retryMonitor) {
+            while (!isBroken() && !shutdown) {
+                try {
+                    retryMonitor.wait(100);
+                } catch (InterruptedException e) {
+                    log.warn("Interrupted", e);
+                }
+            }
+        }
     }
 
     public interface SegmentConsumer {

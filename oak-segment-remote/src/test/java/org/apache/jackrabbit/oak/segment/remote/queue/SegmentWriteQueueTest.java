@@ -29,8 +29,10 @@ import org.mockito.internal.util.reflection.InstanceField;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingDeque;
@@ -208,6 +210,74 @@ public class SegmentWriteQueueTest {
         queue = new SegmentWriteQueue((tarEntry, data, offset, size) -> {});
         queue.close();
         queue.addToQueue(tarEntry(10), EMPTY_DATA, 0, 0);
+    }
+
+    @Test
+    public void testRecoveryMode() throws IOException, InterruptedException {
+        Set<UUID> added = Collections.synchronizedSet(new HashSet<>());
+        Semaphore semaphore = new Semaphore(0);
+        AtomicBoolean doBreak = new AtomicBoolean(true);
+        List<Long> writeAttempts = Collections.synchronizedList(new ArrayList<>());
+        queue = new SegmentWriteQueue((tarEntry, data, offset, size) -> {
+            writeAttempts.add(System.currentTimeMillis());
+            try {
+                semaphore.acquire();
+            } catch (InterruptedException e) {
+            }
+            if (doBreak.get()) {
+                throw new IOException();
+            }
+            added.add(new UUID(tarEntry.getMsb(), tarEntry.getLsb()));
+        });
+
+        for (int i = 0; i < 10; i++) {
+            queue.addToQueue(tarEntry(i), EMPTY_DATA, 0, 0);
+        }
+
+        semaphore.release(Integer.MAX_VALUE);
+        assertTrue("All failed writes should be in the retry queue", awaitCondition(() -> queue.getSize() == 10));
+        assertTrue(queue.isBroken());
+        assertEquals(10, queue.getSize()); // the retrying segment remains in the retry queue
+
+        writeAttempts.clear();
+        awaitWhile(() -> writeAttempts.size() < 5);
+        long lastAttempt = writeAttempts.get(0);
+        for (int i = 1; i < 5; i++) {
+            long delay = writeAttempts.get(i) - lastAttempt;
+            assertTrue("The delay between retry attempts should be at least 1000ms. Actual: " + delay, delay >= 1000);
+            lastAttempt = writeAttempts.get(i);
+        }
+
+        AtomicBoolean addFinished = new AtomicBoolean(false);
+        runInThread(() -> {
+            try {
+                queue.addToQueue(tarEntry(10), EMPTY_DATA, 0, 0);
+                addFinished.set(true);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+
+        Thread.sleep(100);
+        assertFalse("Adding segments should wait while the retry queue is non-empty", addFinished.get());
+
+        doBreak.set(false);
+        awaitWhile(queue::isBroken);
+        assertFalse("The retry queue should be empty after recovery", queue.isBroken());
+
+        awaitWhile(() -> added.size() < 11);
+        assertEquals("All segments should be consumed", 11, added.size());
+        for (int i = 0; i < 11; i++) {
+            assertTrue("All segments should be consumed", added.contains(uuid(i)));
+        }
+
+        int i = writeAttempts.size() - 10;
+        lastAttempt = writeAttempts.get(i);
+        for (; i < writeAttempts.size(); i++) {
+            long delay = writeAttempts.get(i) - lastAttempt;
+            assertTrue("Segments should be persisted immediately", delay < 1000);
+            lastAttempt = writeAttempts.get(i);
+        }
     }
 
     @Test
