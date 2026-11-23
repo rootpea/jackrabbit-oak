@@ -39,7 +39,7 @@ public class SegmentWriteQueue implements Closeable {
 
     private static final int QUEUE_SIZE = Integer.getInteger("oak.segment.remote.queue.size", 20);
 
-    private static final long FLUSH_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(1);
+    private static final long FLUSH_TIMEOUT_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
     private static final Logger log = LoggerFactory.getLogger(SegmentWriteQueue.class);
 
